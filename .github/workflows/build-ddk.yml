@@ -61,7 +61,12 @@ jobs:
             exit 1
           fi
           sed -n '/^struct load_info {/,/^};/p' "$T/kernel/module-internal.h"
-          body=$(sed -n '/^struct load_info {/,/^};/p' "$T/kernel/module-internal.h" | grep -vE '^\s*(/\*|\*|\*/)')
+          # Field positions are counted with the braces and the comments removed,
+          # so field #1 is `const char *name;`.
+          body=$(sed -n '/^struct load_info {/,/^};/p' "$T/kernel/module-internal.h" \
+                 | grep -vE '^\s*(/\*|\*|\*/)' \
+                 | grep -vE '^struct load_info \{' \
+                 | grep -vE '^\};')
           hdr_at=$(printf '%s\n' "$body" | grep -n 'Elf_Ehdr \*hdr;'  | head -1 | cut -d: -f1)
           len_at=$(printf '%s\n' "$body" | grep -n 'unsigned long len;' | head -1 | cut -d: -f1)
           echo "hdr is field #$hdr_at (mirror expects 3rd: offset 0x10)"
@@ -100,7 +105,7 @@ jobs:
                    vmalloc vfree register_kprobe unregister_kprobe \
                    alloc_workqueue destroy_workqueue flush_workqueue queue_work_on \
                    ktime_get_real_ts64 time64_to_tm copy_from_kernel_nofault; do
-            hit=$(grep -rhnE "EXPORT_SYMBOL(_GPL)?(_NS)?\($s," "$T/fs" "$T/kernel" "$T/mm" "$T/lib" 2>/dev/null | head -1)
+            hit=$(grep -rhnE "EXPORT_SYMBOL[A-Z_]*\($s[,)]" "$T/fs" "$T/kernel" "$T/mm" "$T/lib" 2>/dev/null | head -1)
             if [ -z "$hit" ]; then
               echo "::error::$s is not exported by this tree (variant $V) - the module would fail to load with 'Unknown symbol $s'"
               fail=1
@@ -149,8 +154,8 @@ jobs:
           # that the KMI matches, and that has to be said out loud rather than
           # pass as a green build.
           vs=$(readelf -SW "$f" | awk '/\] __versions/ {print $6}')
-          sv=$(readelf -p .modinfo "$f" | grep -c 'srcversion=')
-          ml=$(nm -u "$f" | grep -c 'module_layout')
+          sv=$(readelf -p .modinfo "$f" | grep -c 'srcversion=' || true)
+          ml=$(nm -u "$f" | grep -c 'module_layout' || true)
           echo "__versions size=${vs:-?} srcversion=${sv} module_layout=${ml}"
           if [ "${vs:-0}" = "0" ] || [ "${sv:-0}" = "0" ] || [ "${ml:-0}" = "0" ]; then
             echo "::warning::no symbol CRCs in this build tree: load-time version checks are inert (Module.symvers has no CRC entries)"
