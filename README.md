@@ -66,15 +66,24 @@ make -C $KDIR M=$PWD/kernel ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 modules
 ## 加载
 
 ```sh
-adb push modcapture-android13-5.15.ko /data/local/tmp/modcapture.ko
+adb push dist/modcapture.ko-android13-5.15/modcapture.ko /data/local/tmp/modcapture.ko
 adb shell su -c "insmod /data/local/tmp/modcapture.ko"
-# 或：adb shell su -c "ksud insmod /data/local/tmp/modcapture.ko"
+# 内核若抱怨 vermagic/KMI，改用 KernelSU 的加载器：
+adb shell su -c "ksud insmod /data/local/tmp/modcapture.ko"
 ```
 
-本模块**只依赖导出符号**（`load_module` 是通过 `register_kprobe()` 按名字找到的，不占链接期依赖），
-所以普通 `insmod` 就够，不需要 `ksud insmod`。
-唯一的例外是 `filp_open/kernel_write/override_creds/revert_creds` 走的是
-`ANDROID_GKI_VFS_EXPORT_ONLY` 命名空间，源码末尾已经 `MODULE_IMPORT_NS` 了那个长字符串。
+本模块**只 import 导出符号**，一个未导出符号都没有（`load_module` 是靠 `register_kprobe()`
+按名字找到的，不产生链接期依赖），所以**不需要** ksud 那套符号改写，普通 `insmod` 就够。
+唯一需要留意的是 `filp_open/kernel_write/override_creds/revert_creds` 走
+`ANDROID_GKI_VFS_EXPORT_ONLY` 命名空间，源码末尾已经 `MODULE_IMPORT_NS` 了那个长字符串
+（CI 会在产物里断言 `import_ns` 存在，缺了就直接失败）。
+
+vermagic 由 DDK 那棵内核树给出：`5.15.202-android13-5.15.202_r00-dirty SMP preempt
+mod_unload modversions aarch64`，设备内核是 `5.15.180-android13-8`，版本号对不上。
+但 DDK 的 `Module.symvers` 不带 CRC，产物的 `__versions` 段**存在但为空**，而内核的
+`same_magic()` 只要发现模块有 `__versions` 段就**跳过第一个空格之前的内核版本**、只比后面
+那串（`SMP preempt mod_unload modversions aarch64`）。所以这个版本差通常不影响加载；
+真过不去就用 `ksud insmod`。
 
 卸载：
 
@@ -133,7 +142,8 @@ insmod modcapture.ko slot_size_mb=64 slots=4 dump_dir=/data/local/tmp/ko
 `tools/verify-modcapture.sh`：
 
 ```sh
-adb push modcapture.ko-android13-5.15/modcapture.ko tools/verify-modcapture.sh /data/local/tmp/
+adb push dist/modcapture.ko-android13-5.15/modcapture.ko /data/local/tmp/modcapture.ko
+adb push tools/verify-modcapture.sh /data/local/tmp/
 adb shell su -c "sh /data/local/tmp/verify-modcapture.sh"
 ```
 
