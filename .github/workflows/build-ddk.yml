@@ -1,0 +1,226 @@
+name: build-lkm-ddk
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  # One .ko per GKI 5.15 variant.  A module is NOT portable between them:
+  # vermagic differs and so does the struct load_info layout this module reads
+  # load_module()'s argument through.  android13-5.15 is the branch the target
+  # device runs (5.15.180-android13-8); android14-5.15 is built alongside it
+  # because it is the other 5.15 KMI family and the verification steps below
+  # double as a check that the layout has not moved between releases.
+  module:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - android13-5.15
+          - android14-5.15
+    container:
+      # DDK-min image with the GKI kernel headers (modules_prepare done),
+      # Module.symvers and the matching Clang toolchain.
+      image: ghcr.io/ylarod/ddk-min:${{ matrix.variant }}-20260828
+      options: --privileged
+
+    steps:
+      - name: Inspect DDK environment
+        run: |
+          echo "variant   = ${{ matrix.variant }}"
+          echo "KDIR      = $KDIR"
+          echo "KERNEL_SRC= $KERNEL_SRC"
+          echo "CLANG_PATH= $CLANG_PATH"
+          clang --version | head -1
+
+      - name: Checkout module
+        uses: actions/checkout@v4
+
+      # Everything this module knows about the kernel is in these two
+      # declarations.  Both are checked against the tree that is actually being
+      # compiled against, per variant, instead of trusting the 5.15 source of
+      # one branch to describe another.
+      - name: Assert the assumptions about kernel/module.c
+        run: |
+          set -e
+          V="${{ matrix.variant }}"
+          T=""
+          for d in "${KERNEL_SRC:-}" "${KDIR:-}" "/opt/ddk/src/$V" "/opt/ddk/kdir/$V" /opt/ddk/src/* /opt/ddk/kdir/*; do
+            if [ -n "$d" ] && [ -f "$d/kernel/module.c" ]; then T="$d"; break; fi
+          done
+          if [ -z "$T" ]; then
+            echo "::error::no kernel tree with kernel/module.c found (variant=$V KERNEL_SRC=$KERNEL_SRC KDIR=$KDIR)"
+            exit 1
+          fi
+          echo "=== kernel tree: $T ==="
+
+          echo "--- 1. struct load_info field order (the module mirrors the first four members) ---"
+          if [ ! -f "$T/kernel/module-internal.h" ]; then
+            echo "::error::$T/kernel/module-internal.h is missing; the struct load_info mirror in modcapture.c cannot be checked"
+            exit 1
+          fi
+          sed -n '/^struct load_info {/,/^};/p' "$T/kernel/module-internal.h"
+          body=$(sed -n '/^struct load_info {/,/^};/p' "$T/kernel/module-internal.h" | grep -vE '^\s*(/\*|\*|\*/)')
+          hdr_at=$(printf '%s\n' "$body" | grep -n 'Elf_Ehdr \*hdr;'  | head -1 | cut -d: -f1)
+          len_at=$(printf '%s\n' "$body" | grep -n 'unsigned long len;' | head -1 | cut -d: -f1)
+          echo "hdr is field #$hdr_at (mirror expects 3rd: offset 0x10)"
+          echo "len is field #$len_at (mirror expects 4th: offset 0x18)"
+          if [ "$hdr_at" != "3" ] || [ "$len_at" != "4" ]; then
+            echo "::error::struct load_info layout changed in $V: modcapture.c's mirror (hdr@0x10, len@0x18) no longer matches - refusing to ship a module that would read the wrong offsets"
+            exit 1
+          fi
+          echo "OK: hdr/len are the 3rd and 4th members"
+
+          echo "--- 2. load_module() prototype (the probe's argument is x0 = load_info *) ---"
+          grep -nA2 '^static int load_module(struct load_info \*info' "$T/kernel/module.c" || {
+            echo "::error::load_module() not found with the expected prototype in $V"
+            exit 1
+          }
+
+          echo "--- 3. what load_module() is entered with, in this tree ---"
+          grep -nB2 -A6 'return load_module(&info' "$T/kernel/module.c" || true
+
+      # The module links against exported symbols only (load_module itself is
+      # reached through register_kprobe's name lookup).  An import that is not
+      # actually exported in this tree would not fail the build - it would fail
+      # at insmod time on the device with "Unknown symbol", which is a much
+      # worse place to find out.
+      - name: Assert every imported symbol is exported by this tree
+        run: |
+          set -e
+          V="${{ matrix.variant }}"
+          T=""
+          for d in "${KERNEL_SRC:-}" "${KDIR:-}" "/opt/ddk/src/$V" "/opt/ddk/kdir/$V" /opt/ddk/src/* /opt/ddk/kdir/*; do
+            if [ -n "$d" ] && [ -f "$d/kernel/module.c" ]; then T="$d"; break; fi
+          done
+          echo "=== kernel tree: $T ==="
+          fail=0
+          for s in filp_open kernel_write filp_close override_creds revert_creds \
+                   vmalloc vfree register_kprobe unregister_kprobe \
+                   alloc_workqueue destroy_workqueue flush_workqueue queue_work_on \
+                   ktime_get_real_ts64 time64_to_tm copy_from_kernel_nofault; do
+            hit=$(grep -rhnE "EXPORT_SYMBOL(_GPL)?(_NS)?\($s," "$T/fs" "$T/kernel" "$T/mm" "$T/lib" 2>/dev/null | head -1)
+            if [ -z "$hit" ]; then
+              echo "::error::$s is not exported by this tree (variant $V) - the module would fail to load with 'Unknown symbol $s'"
+              fail=1
+            else
+              printf '  %-26s %s\n' "$s" "$(echo "$hit" | sed 's/^[0-9]*://')"
+            fi
+          done
+          [ "$fail" = "0" ] || exit 1
+
+          echo "--- the VFS namespace those four are exported in (must be imported by the module) ---"
+          grep -rn 'ANDROID_GKI_VFS_EXPORT_ONLY=' "$T/fs/Makefile" "$T/kernel/Makefile" 2>/dev/null || {
+            echo "::error::no ANDROID_GKI_VFS_EXPORT_ONLY definition found in $V - the MODULE_IMPORT_NS() string in modcapture.c was derived from it"
+            exit 1
+          }
+
+      - name: Build modcapture.ko (DDK way)
+        run: |
+          set -e
+          # One line on purpose: a trailing backslash followed by a blank line
+          # ends the shell continuation and silently drops ARCH/CC/LLVM and the
+          # `modules` target.
+          #
+          # -k (keep going) so that one broken object does not hide every later
+          # one; it still exits nonzero when anything failed.
+          make -k -C "$KDIR" M="$PWD/kernel" ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 modules -j"$(nproc)"
+          ls -la kernel/modcapture.ko
+          file kernel/modcapture.ko
+
+      - name: Verify the artifact (sections, namespace import, undefined set)
+        run: |
+          set -e
+          f=kernel/modcapture.ko
+
+          echo "--- sections ---"
+          readelf -SW "$f" | grep -E "__versions|\.BTF|cfi|\.llvm_addrsig|\.plt|modinfo|\.text" || true
+
+          echo "--- modinfo ---"
+          modinfo "$f" || true
+          readelf -p .modinfo "$f" | sed 's/^/  /' || true
+
+          echo "--- KMI version-check state ---"
+          # modpost emits CRCs and srcversion only when the DDK tree's
+          # Module.symvers carries them.  When it does not, the kernel's
+          # check_version() finds no entry for ANY imported symbol and load-time
+          # version checking does not happen - i.e. "it loads" is not evidence
+          # that the KMI matches, and that has to be said out loud rather than
+          # pass as a green build.
+          vs=$(readelf -SW "$f" | awk '/\] __versions/ {print $6}')
+          sv=$(readelf -p .modinfo "$f" | grep -c 'srcversion=')
+          ml=$(nm -u "$f" | grep -c 'module_layout')
+          echo "__versions size=${vs:-?} srcversion=${sv} module_layout=${ml}"
+          if [ "${vs:-0}" = "0" ] || [ "${sv:-0}" = "0" ] || [ "${ml:-0}" = "0" ]; then
+            echo "::warning::no symbol CRCs in this build tree: load-time version checks are inert (Module.symvers has no CRC entries)"
+          fi
+
+          echo "--- VFS namespace import (load-fatal if missing) ---"
+          # filp_open/kernel_write/override_creds/revert_creds live in
+          # EXPORT_SYMBOL_NS(..., ANDROID_GKI_VFS_EXPORT_ONLY).  A module that
+          # does not import the RESULTING string is refused by the loader with
+          #   "module uses symbol (filp_open) from namespace VFS_internal_...
+          #    but does not import it"  ->  "Unknown symbol filp_open (err -22)"
+          readelf -p .modinfo "$f" 2>/dev/null | grep 'import_ns' || {
+            echo "::error::no import_ns entry in $f - filp_open/kernel_write/override_creds/revert_creds will be refused on load (see MODULE_IMPORT_NS at the end of kernel/modcapture.c)"
+            exit 1
+          }
+          readelf -p .modinfo "$f" | grep -q 'VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver' || {
+            echo "::error::import_ns exists but does not name the VFS namespace this tree uses"
+            exit 1
+          }
+
+          echo "--- undefined symbols ---"
+          nm -u "$f" | sed 's/^/  /'
+          n=$(nm -u "$f" | wc -l)
+          echo "  total: $n"
+
+          echo "--- no kallsyms_* link-time dependency (regression gate) ---"
+          # load_module() is reached by NAME through register_kprobe(), which
+          # uses the kernel's own kallsyms.  An import of kallsyms_lookup_name
+          # (or friends) would mean the module had reverted to resolving
+          # symbols at link time, which is exactly the thing that stops an
+          # ordinary insmod from working.
+          ks=$(nm -u "$f" | grep -cE '(^| )(kallsyms_lookup_name|kallsyms_lookup|kallsyms_lookup_size_offset|kallsyms_on_each_symbol|kallsyms_on_each_match_symbol)$' || true)
+          echo "  undefined kallsyms-ish symbols: $ks (must be 0)"
+          if [ "$ks" != "0" ]; then
+            echo "::error::$f imports $ks kallsyms_* symbol(s)"
+            exit 1
+          fi
+
+      # by-name probe targets are a property of the BUILD, not of the source:
+      # under CONFIG_LTO_CLANG_FULL a static function with few callers can be
+      # inlined away and disappear from kallsyms.  load_module() is the one
+      # probe point of this module, so if the image ships a symbol map, check it
+      # here - before anyone loads anything on a device.
+      - name: Check the load_module probe target in the DDK image (best effort)
+        run: |
+          set -e
+          V="${{ matrix.variant }}"
+          S=""
+          for d in "${KDIR:-}" "${KERNEL_SRC:-}" "/opt/ddk/kdir/$V" "/opt/ddk/src/$V" /opt/ddk/kdir/* /opt/ddk/src/*; do
+            if [ -n "$d" ] && { [ -f "$d/vmlinux" ] || [ -f "$d/System.map" ]; }; then S="$d"; break; fi
+          done
+          if [ -z "$S" ]; then
+            echo "no vmlinux/System.map in the DDK image - the runtime load_module check cannot be done here and is NOT being skipped quietly: verify on the device with 'grep load_module /proc/kallsyms'"
+            exit 0
+          fi
+          echo "=== symbol source: $S ==="
+          n=0
+          [ -f "$S/System.map" ] && n=$(grep -cE '(^|[[:space:]])load_module$' "$S/System.map" || true)
+          if [ "${n:-0}" = "0" ] && [ -f "$S/vmlinux" ]; then
+            n=$(nm "$S/vmlinux" 2>/dev/null | grep -cE '(^|[[:space:]])load_module$' || true)
+          fi
+          echo "load_module occurrences: ${n:-0}"
+          if [ "${n:-0}" = "0" ]; then
+            echo "::error::load_module is not in $S (variant $V) - under LTO it may have been inlined away, in which case register_kprobe() at module_init will fail and nothing can be captured"
+            exit 1
+          fi
+
+      - name: Upload .ko
+        uses: actions/upload-artifact@v4
+        with:
+          name: modcapture.ko-${{ matrix.variant }}
+          path: kernel/modcapture.ko
+          if-no-files-found: error
