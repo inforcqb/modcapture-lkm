@@ -73,6 +73,7 @@
 
 #include <linux/module.h>
 #include <linux/kernel.h>
+#include <linux/build_bug.h>
 #include <linux/init.h>
 #include <linux/kprobes.h>
 #include <linux/ptrace.h>
@@ -129,8 +130,12 @@ struct mcap_load_info {
 };
 
 #if defined(CONFIG_64BIT)
-BUILD_BUG_ON(offsetof(struct mcap_load_info, hdr) != 0x10);
-BUILD_BUG_ON(offsetof(struct mcap_load_info, len) != 0x18);
+/* static_assert, not BUILD_BUG_ON: the latter expands to a do/while statement
+ * and is only valid inside a function. */
+static_assert(offsetof(struct mcap_load_info, hdr) == 0x10,
+	      "load_info mirror: hdr must be the 3rd member (offset 0x10)");
+static_assert(offsetof(struct mcap_load_info, len) == 0x18,
+	      "load_info mirror: len must be the 4th member (offset 0x18)");
 #endif
 
 /* ------------------------------------------------------------------ */
