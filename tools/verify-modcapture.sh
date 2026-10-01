@@ -38,6 +38,22 @@ bad() { echo "  [FAIL] $*"; fail=$((fail + 1)); }
 info() { echo "  ...    $*"; }
 
 dmesg_snapshot() { dmesg > "$TMP/$1" 2>/dev/null || : > "$TMP/$1"; }
+# Try a plain insmod first; fall back to KernelSU's ksud, which also tolerates a
+# module whose vermagic was produced by a different (DDK) kernel tree.
+load_ko() {
+	insmod "$1" 2>"$TMP/insmod.err" && return 0
+	if command -v ksud >/dev/null 2>&1; then
+		info "insmod failed ($(head -1 "$TMP/insmod.err" 2>/dev/null)); retrying with 'ksud insmod'"
+		ksud insmod "$1" >"$TMP/insmod.err" 2>&1 && return 0
+	fi
+	return 1
+}
+# Only used to make the kernel call load_module(); its own result is irrelevant.
+poke_ko() {
+	insmod "$1" >"$TMP/victim.err" 2>&1 && return 0
+	command -v ksud >/dev/null 2>&1 && ksud insmod "$1" >"$TMP/victim.err" 2>&1
+	return 0
+}
 # Only the lines added since the previous snapshot.  If the ring buffer wrapped
 # (fewer lines now than before) the whole buffer is scanned and that is said out
 # loud rather than silently mis-sliced.
@@ -92,13 +108,13 @@ info "$(grep -c . "$TMP/before" 2>/dev/null || echo 0) .ko file(s) in $DIR befor
 # ---------------------------------------------------------------- 1. load
 echo
 echo "-- 1. load modcapture and check the probe armed"
-if ! insmod "$KO" 2>"$TMP/insmod.err"; then
-	bad "insmod $KO failed: $(cat "$TMP/insmod.err")"
+if ! load_ko "$KO"; then
+	bad "loading $KO failed: $(cat "$TMP/insmod.err" 2>/dev/null | head -3)"
 	echo "       (a refusal here is by design when load_module is absent - see dmesg)"
 	dmesg 2>/dev/null | tail -20 | sed 's/^/         /'
 	exit 1
 fi
-ok "insmod"
+ok "loaded"
 
 if grep -q "^$MODNAME " /proc/modules 2>/dev/null; then
 	ok "present in /proc/modules"
@@ -116,8 +132,8 @@ esac
 # ---------------------------------------------------------------- 2. trigger
 echo
 echo "-- 2. trigger a module load"
-insmod "$VICTIM" 2>"$TMP/victim.err"
-info "insmod $VICTIM -> $(head -1 "$TMP/victim.err" 2>/dev/null)   (a failure here is expected)"
+poke_ko "$VICTIM"
+info "loading $VICTIM again -> $(head -1 "$TMP/victim.err" 2>/dev/null)   (a failure here is expected)"
 sleep 1
 sync
 
