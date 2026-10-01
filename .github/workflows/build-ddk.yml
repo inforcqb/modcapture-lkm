@@ -91,6 +91,17 @@ jobs:
       # actually exported in this tree would not fail the build - it would fail
       # at insmod time on the device with "Unknown symbol", which is a much
       # worse place to find out.
+      #
+      # NECESSARY, NOT SUFFICIENT.  This checks the tree the module is compiled
+      # against; what the DEVICE kernel exports to modules is its own business,
+      # and it is not always the same.  Measured on the target PJA110
+      # (5.15.180-android13-8): this tree exports filp_open/kernel_write, the
+      # device refuses both with "Unknown symbol filp_open (err -2)" (-ENOENT =
+      # not in the export table at all, not a namespace mismatch), so the module
+      # there can only be loaded by KernelSU's `ksud insmod`, which binds
+      # undefined symbols to kallsyms addresses before init_module(2) and never
+      # consults the export table.  The device-side equivalent of this check is
+      # `dmesg | grep 'Unknown symbol'` right after an attempted load.
       - name: Assert every imported symbol is exported by this tree
         run: |
           set -e
