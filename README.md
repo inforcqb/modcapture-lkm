@@ -67,29 +67,57 @@ make -C $KDIR M=$PWD/kernel ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 modules
 
 ```sh
 adb push dist/modcapture.ko-android13-5.15/modcapture.ko /data/local/tmp/modcapture.ko
-adb shell su -c "insmod /data/local/tmp/modcapture.ko"
-# 内核若抱怨 vermagic/KMI，改用 KernelSU 的加载器：
 adb shell su -c "ksud insmod /data/local/tmp/modcapture.ko"
 ```
 
-本模块**只 import 导出符号**，一个未导出符号都没有（`load_module` 是靠 `register_kprobe()`
-按名字找到的，不产生链接期依赖），所以**不需要** ksud 那套符号改写，普通 `insmod` 就够。
-唯一需要留意的是 `filp_open/kernel_write/override_creds/revert_creds` 走
-`ANDROID_GKI_VFS_EXPORT_ONLY` 命名空间，源码末尾已经 `MODULE_IMPORT_NS` 了那个长字符串
-（CI 会在产物里断言 `import_ns` 存在，缺了就直接失败）。
+**必须用 `ksud insmod`**（和 `susfs_guard_lkm` 一样）。真机实测，普通 `insmod` 会在
+**符号解析**阶段失败：
+
+```
+modcapture: Unknown symbol filp_open (err -2)
+modcapture: Unknown symbol kernel_write (err -2)
+insmod: failed to load /data/local/tmp/modcapture.ko: No such file or directory
+```
+
+`err -2` 是 `-ENOENT`，即**这台设备的内核根本没把这两个符号导出给模块**。注意这跟
+"DDK 源码树里 `EXPORT_SYMBOL_NS(filp_open, ANDROID_GKI_VFS_EXPORT_ONLY)` 存在"并不矛盾：
+CI 只能核对**编译所用的那棵源码树**（这一步仍然值得做，它挡的是"源码里就没导出"），
+但**设备上装的那颗内核导出什么，只有设备自己知道**。`ksud insmod` 绕开的正是这一层：
+它在 `init_module(2)` 之前把每个未定义符号的 `st_value` 直接填成 kallsyms 里的运行时地址并标成绝对符号，
+所以内核的导出表查找根本不会发生。
+
+`filp_open/kernel_write/override_creds/revert_creds` 走 `ANDROID_GKI_VFS_EXPORT_ONLY` 命名空间，
+源码末尾已经 `MODULE_IMPORT_NS` 了那个长字符串，CI 也会在产物里断言 `import_ns` 存在。
 
 vermagic 由 DDK 那棵内核树给出：`5.15.202-android13-5.15.202_r00-dirty SMP preempt
-mod_unload modversions aarch64`，设备内核是 `5.15.180-android13-8`，版本号对不上。
-但 DDK 的 `Module.symvers` 不带 CRC，产物的 `__versions` 段**存在但为空**，而内核的
+mod_unload modversions aarch64`，设备内核是 `5.15.180-android13-8`。但 DDK 的
+`Module.symvers` 不带 CRC，产物的 `__versions` 段**存在但为 0 字节**，而内核的
 `same_magic()` 只要发现模块有 `__versions` 段就**跳过第一个空格之前的内核版本**、只比后面
-那串（`SMP preempt mod_unload modversions aarch64`）。所以这个版本差通常不影响加载；
-真过不去就用 `ksud insmod`。
+那串（`SMP preempt mod_unload modversions aarch64`）—— 实测这一关是过得去的，
+真正卡住你的是上面的符号导出。
 
 卸载：
 
 ```sh
 adb shell su -c "rmmod modcapture"
 ```
+
+## 抓到的到底是什么
+
+**是"内核被要求加载的那份镜像"**，不是"磁盘上那个文件"。两者在正常情况下相同，但有个例外必须知道：
+
+| 加载方式 | 内核收到的东西 | dump 与磁盘文件 |
+|---|---|---|
+| `insmod` / `modprobe`（`finit_module(2)` 直接读文件） | 原文件的逐字节副本 | **完全一致**（真机 md5 实测相同） |
+| KernelSU 的 `ksud insmod` | ksud **在系统调用之前**改写过符号表的镜像 | 大小相同、ELF 完整，但 `st_value` 已被填成内核地址 |
+
+第二条不是缺陷，是物理事实：**ksud 改完才交给内核，内核里从来就不存在那份"原文件"**，
+所以任何在内核侧挂的钩子都拿不到未改写的版本。换个角度说，ksud 路径 dump 出来的东西
+反而多带一个信息 —— 每个符号被绑到了哪个内核地址。
+
+真机实测（modcapture.ko 自捕获，309656 字节）：两条路各出一份，`insmod` 那份 md5 与源文件相同；
+`ksud` 那份共 **389 字节 / 40 段**不同，全部落在 `.symtab` 区间（`0x48d80`–`0x4a160`），
+其余 section 一个字节都没动，`modinfo` 照常读得出 `name=modcapture`。
 
 ## 用法
 
@@ -129,13 +157,17 @@ insmod modcapture.ko slot_size_mb=64 slots=4 dump_dir=/data/local/tmp/ko
 
 ## 已知边界
 
+- **本模块自己也得用 `ksud insmod` 加载**（原因见上文），因为它要写文件、而设备内核不导出 `filp_open`。
 - **只有加载顺序在后面的模块**会被抓（定义如此）。改 `enabled=0/1` 只能关掉以后的捕获，不能补回之前的。
 - **超大模块**（> `slot_size_mb`）计数后跳过，`rmmod` 时会打印 `oversized=N`。
 - **`rmmod` 会解除探针**，模块卸载后不再捕获。
 - 本模块**不隐藏自己**：`/proc/modules`、`lsmod` 里都看得到 `modcapture`。
 - `load_module()` 在 `CONFIG_LTO_CLANG_FULL` 下有可能被内联掉。本机
-  （`5.15.180-android13-8`）实测 `/proc/kallsyms` 里有它；如果哪个内核没有，
-  `register_kprobe()` 会在 `module_init` 里失败并**明确报错拒绝加载**，而不是装成一个没用的模块。
+  （`5.15.180-android13-8`）实测 `/proc/kallsyms` 里有它（同树上 `copy_module_from_user`、
+  `module_sig_check`、`elf_validity_check`、`setup_load_info`、`rewrite_section_headers`、
+  `layout_and_allocate` **全被内联掉了**，所以落点只能选 `load_module`）；
+  如果哪个内核没有它，`register_kprobe()` 会在 `module_init` 里失败并**明确报错拒绝加载**，
+  而不是装成一个没用的模块。
 
 ## 设备上验证
 
@@ -147,6 +179,21 @@ adb push tools/verify-modcapture.sh /data/local/tmp/
 adb shell su -c "sh /data/local/tmp/verify-modcapture.sh"
 ```
 
-它会：确认探针装上 → 实际触发一次加载 → 找到新生成的 `*.ko` → **和源文件逐字节比对 md5**
-→ 检查文件名符合时间戳格式 → 检查 `modcapture.log` → 扫 dmesg 里有没有
+它会：确认探针装上 → 实际触发两次加载（`insmod` / `ksud insmod`，两条路断言不同）→
+找到新生成的 `*.ko` → **`insmod` 那份与源文件逐字节比对**、`ksud` 那份核对大小与可读性 →
+检查文件名符合时间戳格式 → 检查 `modcapture.log` → 扫 dmesg 里有没有
 `BUG:/WARNING:/CFI failure/Oops`，最后卸干净。
+
+真机结果（PJA110 / `5.15.180-android13-8-o-01179` / KernelSU `u:r:ksu:s0`）：
+`14 passed, 0 failed`（exit 0），`rmmod` 汇总 `captured=2 dropped=0 oversized=0 write_fail=0`，
+dmesg 无 BUG/WARNING/CFI failure/Oops。
+
+另外单独做了一次交叉验证：把 **android14-5.15 那份产物**（313296 字节，内容与源文件不同）
+推上设备再触发一次加载。两次加载**都失败**（内核里已有一个同名模块，`-EEXIST`），但**两份 dump 都出来了** ——
+这正是"捕获发生在校验之前"的实证：
+
+```
+99da46054b82624ffaa04ae7080ad1f3  other-a14.ko                       (源文件 313296 B)
+99da46054b82624ffaa04ae7080ad1f3  20261001-140356-588988.ko          insmod 路径：完全一致
+73c5a9a5dc2d4226055fe363ff634d39  20261001-140357-776147.ko          ksud 路径：389 字节不同
+```
