@@ -568,8 +568,10 @@ static void __exit mcap_exit(void)
 	mcap_nslots = 0;
 
 	pr_info("unloaded: captured=%lld dropped=%lld oversized=%lld write_fail=%lld\n",
-		atomic64_read(&mcap_captured), atomic64_read(&mcap_dropped),
-		atomic64_read(&mcap_oversized), atomic64_read(&mcap_write_fail));
+		(long long)atomic64_read(&mcap_captured),
+		(long long)atomic64_read(&mcap_dropped),
+		(long long)atomic64_read(&mcap_oversized),
+		(long long)atomic64_read(&mcap_write_fail));
 }
 
 module_init(mcap_init);
